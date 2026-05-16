@@ -55,65 +55,63 @@ class TrafficPredictor:
     def prepare_data(self, df, target_col='total_bytes_per_sec', test_size=0.2):
         """
         학습 데이터 준비
-        
-        Args:
-            df: 입력 DataFrame
-            target_col: 예측 대상 컬럼
-            test_size: 테스트 데이터 비율
         """
         print("데이터 준비 중...")
-        
-        # 타겟 컬럼 확인
+
         if target_col not in df.columns:
             raise ValueError(f"Target column '{target_col}' not found in DataFrame")
-        
-        # 특성 선택 (숫자형 컬럼만)
+
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        
-        # 제외할 컬럼 (target_col도 create_sequences에서 제외되므로 여기서도 제외)
-        exclude_cols = ['is_anomaly', 'z_score', 'errors', 'drops', target_col]
-        feature_cols = [col for col in numeric_cols if col not in exclude_cols]
-        
+
+        # target 누설 차단: target의 구성요소(sent/recv)와 파생값(ma/std/diff) 제외
+        leakage_cols = {
+            target_col,
+            'bytes_sent_per_sec', 'bytes_recv_per_sec',
+            f'{target_col}_ma10', f'{target_col}_std10', f'{target_col}_diff',
+        }
+        exclude_cols = {'is_anomaly', 'z_score', 'errors', 'drops'} | leakage_cols
+        feature_cols = [c for c in numeric_cols if c not in exclude_cols]
+
         print(f"사용할 특성: {len(feature_cols)}개")
         print(f"특성 목록: {feature_cols}")
-        
-        # 데이터 정규화
+
+        # 시계열 분할: 스케일러 fit 전에 먼저 분리 (테스트 누설 차단)
+        split_idx = int(len(df) * (1 - test_size))
+        train_df = df.iloc[:split_idx]
+        test_df = df.iloc[split_idx:]
+        print(f"행 단위 분할 - train: {len(train_df)}, test: {len(test_df)}")
+
         from sklearn.preprocessing import MinMaxScaler
-        self.scaler = MinMaxScaler()
-        
-        scaled_data = self.scaler.fit_transform(df[feature_cols])
-        scaled_df = pd.DataFrame(scaled_data, columns=feature_cols)
-        
-        # target 컬럼도 스케일링 (예측값 역변환을 위해)
-        target_scaler = MinMaxScaler()
-        scaled_target = target_scaler.fit_transform(df[[target_col]])
-        scaled_df[target_col] = scaled_target
-        
-        # 시퀀스 생성 (이제 target_col이 포함된 상태)
-        X, y = self.processor.create_sequences(
-            scaled_df, 
-            sequence_length=self.sequence_length,
-            target_col=target_col
-        )
-        
-        # target_scaler도 저장
-        self.target_scaler = target_scaler
-        
-        print(f"시퀀스 shape: X={X.shape}, y={y.shape}")
-        
-        # 학습/테스트 분할
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, shuffle=False
-        )
-        
-        print(f"학습 데이터: {X_train.shape}, 테스트 데이터: {X_test.shape}")
-        
+        self.scaler = MinMaxScaler().fit(train_df[feature_cols])
+        self.target_scaler = MinMaxScaler().fit(train_df[[target_col]])
+
+        train_X_scaled = self.scaler.transform(train_df[feature_cols])
+        test_X_scaled = self.scaler.transform(test_df[feature_cols])
+        train_y_scaled = self.target_scaler.transform(train_df[[target_col]]).flatten()
+        test_y_scaled = self.target_scaler.transform(test_df[[target_col]]).flatten()
+
+        seq_len = self.sequence_length
+
+        # train 시퀀스
+        X_train = np.array([train_X_scaled[i:i+seq_len] for i in range(len(train_X_scaled) - seq_len)])
+        y_train = np.array([train_y_scaled[i+seq_len] for i in range(len(train_X_scaled) - seq_len)])
+
+        # test 시퀀스: 시간적 연속성 위해 train 끝 seq_len을 워밍업으로 prepend
+        combined_X = np.concatenate([train_X_scaled[-seq_len:], test_X_scaled])
+        combined_y = np.concatenate([train_y_scaled[-seq_len:], test_y_scaled])
+        X_test = np.array([combined_X[i:i+seq_len] for i in range(len(combined_X) - seq_len)])
+        y_test = np.array([combined_y[i+seq_len] for i in range(len(combined_X) - seq_len)])
+
+        print(f"시퀀스 shape: X_train={X_train.shape}, X_test={X_test.shape}")
+
+        self.feature_cols = feature_cols
         return X_train, X_test, y_train, y_test, feature_cols
     
-    def train(self, X_train, y_train, X_val=None, y_val=None, epochs=EPOCHS, batch_size=BATCH_SIZE):
+    def train(self, X_train, y_train, X_val=None, y_val=None, epochs=EPOCHS, batch_size=BATCH_SIZE,
+              extra_callbacks=None):
         """
         모델 학습
-        
+
         Args:
             X_train: 학습 데이터
             y_train: 학습 라벨
@@ -121,18 +119,20 @@ class TrafficPredictor:
             y_val: 검증 라벨
             epochs: 학습 에포크 수
             batch_size: 배치 크기
+            extra_callbacks: 기본 콜백(EarlyStopping/ModelCheckpoint)에 추가할 Keras 콜백 리스트.
+                서비스 계층에서 진행률 보고용 콜백을 주입할 때 사용.
         """
         print("모델 구축 중...")
-        
+
         input_shape = (X_train.shape[1], X_train.shape[2])
-        
+
         if self.model_type == 'lstm':
             self.model = self.build_lstm_model(input_shape)
         else:
             raise ValueError(f"Unsupported model type: {self.model_type}")
-        
+
         print(self.model.summary())
-        
+
         # 콜백 설정
         callbacks = [
             EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
@@ -142,6 +142,8 @@ class TrafficPredictor:
                 save_best_only=True
             )
         ]
+        if extra_callbacks:
+            callbacks.extend(extra_callbacks)
         
         # 학습
         print("모델 학습 시작...")
@@ -160,43 +162,32 @@ class TrafficPredictor:
         return history
     
     def evaluate(self, X_test, y_test):
-        """모델 평가"""
+        """모델 평가 (원본 스케일 기준)"""
         print("\n모델 평가 중...")
-        
-        y_pred = self.model.predict(X_test)
-        
-        # 메트릭 계산
-        mse = mean_squared_error(y_test, y_pred)
+
+        y_pred = self.model.predict(X_test).flatten()
+        y_test = np.asarray(y_test).flatten()
+
+        y_test_orig = self.target_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+        y_pred_orig = self.target_scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
+
+        mse = mean_squared_error(y_test_orig, y_pred_orig)
         rmse = np.sqrt(mse)
-        mae = mean_absolute_error(y_test, y_pred)
-        r2 = r2_score(y_test, y_pred)
-        
-        # 원래 스케일로 복원하여 평가
-        if hasattr(self, 'target_scaler'):
-            y_test_orig = self.target_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
-            y_pred_orig = self.target_scaler.inverse_transform(y_pred).flatten()
-        else:
-            # target_scaler가 없으면 일반 scaler의 첫 번째 특성 사용
-            y_test_orig = y_test * (self.scaler.data_max_[0] - self.scaler.data_min_[0]) + self.scaler.data_min_[0]
-            y_pred_orig = y_pred.flatten() * (self.scaler.data_max_[0] - self.scaler.data_min_[0]) + self.scaler.data_min_[0]
-        
-        mae_orig = mean_absolute_error(y_test_orig, y_pred_orig)
-        
-        print(f"\n평가 결과:")
-        print(f"  MSE: {mse:.6f}")
-        print(f"  RMSE: {rmse:.6f}")
-        print(f"  MAE: {mae:.6f}")
-        print(f"  MAE (원본 스케일): {mae_orig:.2f} bytes/sec")
+        mae = mean_absolute_error(y_test_orig, y_pred_orig)
+        r2 = r2_score(y_test_orig, y_pred_orig)
+
+        print(f"\n평가 결과 (원본 스케일):")
+        print(f"  MSE: {mse:,.2f}")
+        print(f"  RMSE: {rmse:,.2f} bytes/sec")
+        print(f"  MAE: {mae:,.2f} bytes/sec")
         print(f"  R² Score: {r2:.6f}")
-        
+
         metrics = {
             'mse': float(mse),
             'rmse': float(rmse),
             'mae': float(mae),
-            'mae_original': float(mae_orig),
-            'r2': float(r2)
+            'r2': float(r2),
         }
-        
         return metrics, y_pred
     
     def save_model(self, filepath):

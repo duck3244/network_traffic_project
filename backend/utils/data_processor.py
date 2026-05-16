@@ -54,21 +54,38 @@ class TrafficDataProcessor:
     def add_statistical_features(self, df, window_size=10):
         """통계적 특성 추가 (이동평균, 표준편차 등)"""
         df = df.copy()
-        
+
         traffic_col = 'total_bytes_per_sec'
-        
+
         if traffic_col in df.columns:
             # 이동평균
             df[f'{traffic_col}_ma{window_size}'] = df[traffic_col].rolling(
                 window=window_size, min_periods=1).mean()
-            
+
             # 이동 표준편차
             df[f'{traffic_col}_std{window_size}'] = df[traffic_col].rolling(
                 window=window_size, min_periods=1).std().fillna(0)
-            
+
             # 변화율
             df[f'{traffic_col}_diff'] = df[traffic_col].diff().fillna(0)
-            
+
+        return df
+
+    def add_lag_features(self, df, target_col='total_bytes_per_sec',
+                        lags=(1, 5, 60, 1440)):
+        """과거 시점의 target 값을 lag feature로 추가 (1분 간격 데이터 기준).
+
+        lags 기본값:
+          1    → 1분 전
+          5    → 5분 전 (단기 추세)
+          60   → 1시간 전
+          1440 → 24시간 전 (전일 동시각, daily 주기)
+        """
+        df = df.copy()
+        if target_col not in df.columns:
+            return df
+        for lag in lags:
+            df[f'{target_col}_lag{lag}'] = df[target_col].shift(lag)
         return df
     
     def detect_anomalies(self, df, column='total_bytes_per_sec', threshold=3):
@@ -145,7 +162,17 @@ class TrafficDataProcessor:
             
             print("통계적 특성 추가...")
             df = self.add_statistical_features(df)
-        
+
+            print("Lag 특성 추가...")
+            df = self.add_lag_features(df)
+
+            # lag로 생긴 초기 NaN 행은 drop (bfill로 채우면 시계열 누설)
+            lag_cols = [c for c in df.columns if '_lag' in c]
+            if lag_cols:
+                before = len(df)
+                df = df.dropna(subset=lag_cols).reset_index(drop=True)
+                print(f"Lag NaN 제거: {before} → {len(df)} 행")
+
         # 이상치 탐지
         if detect_anomaly:
             print("이상치 탐지...")

@@ -21,11 +21,11 @@ COLLECTION_DURATION = 300  # 초 (5분)
 INTERFACE = None  # None이면 기본 인터페이스 사용
 
 # 데이터 전처리 설정
-SEQUENCE_LENGTH = 24  # LSTM 입력 시퀀스 길이
+SEQUENCE_LENGTH = 120  # 1초 간격 데이터 기준 2분 윈도우 (단기 패턴 포착용)
 TRAIN_TEST_SPLIT = 0.8  # 학습/테스트 데이터 비율
 
 # 모델 설정
-LSTM_UNITS = [64, 32]
+LSTM_UNITS = [32, 16]
 DROPOUT_RATE = 0.2
 LEARNING_RATE = 0.001
 EPOCHS = 50
